@@ -1,0 +1,18 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+tqdm
+
+# embedding-based blocking (optional but recommended — set
+# CFG.USE_EMBEDDING_BLOCKING = False in config.py to skip this dependency)
+sentence-transformers
+torch
+
+# GPU kNN blocking (install the right variant for your CUDA version)
+# pip install faiss-gpu-cu12    # for CUDA 12.x
+# pip install faiss-gpu-cu11    # for CUDA 11.x
+# On CPU-only machines:
+# pip install faiss-cpu
+faiss-cpu
