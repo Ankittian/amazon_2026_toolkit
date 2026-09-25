@@ -6,6 +6,11 @@ End-to-end test-set inference: load -> block -> feature -> score -> threshold
 (exactly the candidates the model scored), matching the PS's requirement
 that it be the last-stage set, not an earlier looser blocking pass.
 
+Feature notes (auto-inherited from features.py — no changes needed here):
+  - number_overlap and addr_a/b_missing are computed inside pair_features(),
+    so they are produced identically at train and inference time as long as
+    both use the same features.py.  No extra wiring required.
+
 Usage:
     python inference_pipeline.py --model outputs_model.txt --threshold_file outputs_threshold.txt
 """
@@ -20,12 +25,36 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
+from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 
 from config import CFG
 from data_utils import load_source, write_matching_results, write_candidate_pairs
 from blocking import generate_candidates
 from features import fit_tfidf_on_all_text, build_feature_matrix, df_to_lookup
+
+
+def _fit_tfidf_memory_efficient(*paths) -> TfidfVectorizer:
+    """
+    Fit TF-IDF without holding all DataFrames in memory simultaneously.
+    Reads each source, extracts text, then releases the DataFrame before
+    moving to the next one.  On a 32 GB machine this avoids the ~18 GB
+    peak caused by keeping all 6 source DFs alive at once.
+    """
+    print("  Fitting TF-IDF (memory-efficient streaming across all sources)...")
+    all_text = []
+    for path in paths:
+        print(f"    collecting text from {os.path.basename(path)}...")
+        df = load_source(path)
+        if len(df) > CFG.TFIDF_SAMPLE_SIZE:
+            df = df.sample(n=CFG.TFIDF_SAMPLE_SIZE, random_state=42)
+        all_text.extend((df["norm_name"] + " " + df["norm_addr"]).tolist())
+        del df   # release immediately
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), max_features=20000)
+    vec.fit(all_text)
+    del all_text
+    print("  TF-IDF fitted.")
+    return vec
 
 
 def main():
@@ -43,18 +72,18 @@ def main():
             threshold = float(f.read().strip())
     print(f"Using decision threshold: {threshold}")
 
-    print("Loading train sources (for a consistent TF-IDF fit) and test sources...")
-    s1_train = load_source(CFG.TRAIN_S1)
-    s2_train = load_source(CFG.TRAIN_S2)
-    s3_train = load_source(CFG.TRAIN_S3)
+    # Fit TF-IDF on train+test text so vocabulary covers France (test-only
+    # country).  DFs are released after text extraction to minimise peak RAM.
+    print("Fitting TF-IDF across all sources (train + test)...")
+    tfidf_vec = _fit_tfidf_memory_efficient(
+        CFG.TRAIN_S1, CFG.TRAIN_S2, CFG.TRAIN_S3,
+        CFG.TEST_S1,  CFG.TEST_S2,  CFG.TEST_S3,
+    )
 
+    print("Loading test sources...")
     s1 = load_source(CFG.TEST_S1)
     s2 = load_source(CFG.TEST_S2)
     s3 = load_source(CFG.TEST_S3)
-
-    # Fit TF-IDF on the union of train+test text so vocabulary covers France
-    # (test-only country) rather than only what appeared in training.
-    tfidf_vec = fit_tfidf_on_all_text(s1_train, s2_train, s3_train, s1, s2, s3)
 
     print("Generating candidates for the full test Source-1 set...")
     cache_test_prefix = os.path.join(CFG.CACHE_DIR, "candidates_test")

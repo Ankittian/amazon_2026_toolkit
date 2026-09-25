@@ -204,6 +204,9 @@ def generate_candidates(s1_df, s2_df, s3_df, use_embeddings=None, cache_prefix=N
     key_s3 = string_key_candidates(s1_df, s3_df, cache_path=s3_cache)
 
     combined = defaultdict(set)
+    # Pre-seed so entities with zero candidates still appear in the result dict.
+    for s1_id in s1_df["entity_id"]:
+        combined[s1_id]  # touch to insert empty set
     for s1_id in s1_df["entity_id"]:
         if s1_id in key_s2:
             combined[s1_id].update(key_s2[s1_id])

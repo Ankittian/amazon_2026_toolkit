@@ -38,7 +38,17 @@ class Config:
     VAL_FRAC: float = 0.15         # held out at the *S1-entity* level, not row level
 
     # ---- Negative sampling for training the pairwise classifier ----
-    MAX_NEGATIVES_PER_POSITIVE: int = 5
+    MAX_NEGATIVES_PER_POSITIVE: int = 4   # raised from 5→4 to tighten imbalance slightly
+
+    # ---- Training entity subsampling (EDA: 2.2M S1 entities is far more than needed) ----
+    # Set to None to use all entities; otherwise a random stratified sample of this many
+    # S1 entity IDs is drawn (stratified by country + match-count bucket) before
+    # generating candidates and building feature matrices.  150k–200k gives ~95% of the
+    # signal at ~10% of the compute cost.
+    TRAIN_ENTITY_SAMPLE: int = 175_000   # None = use all; int = stratified subsample size
+    TRAIN_ENTITY_SAMPLE_SEED: int = 42   # separate seed so changing it doesn't affect other rng
+    TFIDF_SAMPLE_SIZE: int = 100_000     # Subsample size per dataframe to avoid memory blowup during TF-IDF fitting
+
 
     # ---- GPU acceleration (for 80 GB VRAM Linux server) ----
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
