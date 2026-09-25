@@ -6,6 +6,7 @@ Usage:
     python train_matcher.py
 """
 
+import os
 import random
 import numpy as np
 import lightgbm as lgb
@@ -92,12 +93,13 @@ def main():
     s1_train = s1[s1["entity_id"].isin(train_ids)].reset_index(drop=True)
     s1_val = s1[s1["entity_id"].isin(val_ids)].reset_index(drop=True)
 
-    print("Generating candidates (train split)...")
-    cand_train = generate_candidates(s1_train, s2, s3)
-    print(f"  candidate recall on train split: {candidate_recall(cand_train, gt):.4f}")
+    print("Generating candidates (all Source-1 train entities)...")
+    cache_train_prefix = os.path.join(CFG.CACHE_DIR, "candidates_train")
+    cand_all = generate_candidates(s1, s2, s3, cache_prefix=cache_train_prefix)
 
-    print("Generating candidates (val split)...")
-    cand_val = generate_candidates(s1_val, s2, s3)
+    cand_train = {k: cand_all[k] for k in train_ids if k in cand_all}
+    cand_val = {k: cand_all[k] for k in val_ids if k in cand_all}
+    print(f"  candidate recall on train split: {candidate_recall(cand_train, gt):.4f}")
     gt_val_subset = {k: v for k, v in gt.items() if k in val_ids}
     print(f"  candidate recall on val split:   {candidate_recall(cand_val, gt_val_subset):.4f}")
     # If this number is low, fix blocking.py before touching the classifier —

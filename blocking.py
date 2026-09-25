@@ -12,26 +12,75 @@ unioned together:
 Returns candidates as {s1_entity_id: set(s2/s3_entity_ids)}.
 """
 
+import os
+import gc
 from collections import defaultdict
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 from config import CFG
 from normalize import blocking_key
 
 
-def string_key_candidates(s1_df, other_df, prefix_len=None):
+def save_candidates_cache(candidates: dict, cache_path: str):
+    """Saves candidate mapping {s1_id: set(cand_ids)} to compressed parquet."""
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    s1_ids = list(candidates.keys())
+    cand_strs = [",".join(sorted(candidates[k])) if candidates[k] else "" for k in s1_ids]
+    df = pd.DataFrame({"source1_entity_id": s1_ids, "candidate_ids": cand_strs})
+    df.to_parquet(cache_path, index=False)
+    print(f"  Saved candidate cache to {cache_path} ({len(candidates):,} entities)")
+
+
+def load_candidates_cache(cache_path: str) -> dict:
+    """Loads candidate mapping from parquet cache."""
+    print(f"  Loading candidate cache from {cache_path}...")
+    df = pd.read_parquet(cache_path)
+    s1_ids = df["source1_entity_id"].values
+    cand_strs = df["candidate_ids"].values
+    loaded = {}
+    for s1_id, c_str in zip(s1_ids, cand_strs):
+        loaded[s1_id] = set(c_str.split(",")) if c_str else set()
+    return loaded
+
+
+def string_key_candidates(s1_df, other_df, prefix_len=None, max_candidates=None, cache_path=None):
+    if cache_path and os.path.exists(cache_path):
+        return load_candidates_cache(cache_path)
+
     prefix_len = prefix_len or CFG.BLOCK_KEY_PREFIX_LEN
+    max_candidates = max_candidates or getattr(CFG, "MAX_STRING_CANDIDATES_PER_KEY", 300)
 
     other_by_key = defaultdict(list)
     for row in tqdm(other_df.itertuples(index=False), total=len(other_df), desc="  Indexing string keys (target)"):
         key = blocking_key(row.norm_name, row.country, prefix_len)
         other_by_key[key].append(row.entity_id)
 
+    # Convert to tuples and cap mega-buckets (e.g. generic prefixes with 30k+ entities)
+    # to prevent runaway Cartesian memory explosion and OOM
+    other_by_key_tuple = {}
+    for k, v in other_by_key.items():
+        if max_candidates and len(v) > max_candidates:
+            other_by_key_tuple[k] = tuple(v[:max_candidates])
+        else:
+            other_by_key_tuple[k] = tuple(v)
+    del other_by_key
+    gc.collect()
+
+    empty_tuple = ()
     candidates = {}
     for row in tqdm(s1_df.itertuples(index=False), total=len(s1_df), desc="  Matching string keys (source)"):
         key = blocking_key(row.norm_name, row.country, prefix_len)
-        candidates[row.entity_id] = set(other_by_key.get(key, []))
+        cands = other_by_key_tuple.get(key, empty_tuple)
+        candidates[row.entity_id] = set(cands)
+
+    del other_by_key_tuple
+    gc.collect()
+
+    if cache_path:
+        save_candidates_cache(candidates, cache_path)
+
     return candidates
 
 
@@ -39,7 +88,40 @@ def _combined_text(df):
     return (df["norm_name"] + " " + df["norm_addr"]).tolist()
 
 
-def embedding_knn_candidates(s1_df, other_df, top_k=None, model_name=None, batch_size=None):
+def _get_or_compute_embeddings(df, country, model, batch_size, cache_key=None):
+    """
+    Computes or loads normalized dense embeddings (np.float32).
+    If CFG.SAVE_RAW_EMBEDDINGS is True, saves/loads vectors from disk in FP16 to save space.
+    """
+    cache_file = None
+    save_raw = getattr(CFG, "SAVE_RAW_EMBEDDINGS", True)
+    if save_raw and cache_key:
+        vec_dir = os.path.join(CFG.CACHE_DIR, "vectors")
+        os.makedirs(vec_dir, exist_ok=True)
+        safe_country = "".join(c if c.isalnum() else "_" for c in str(country).lower())
+        cache_file = os.path.join(vec_dir, f"{os.path.basename(cache_key)}_{safe_country}.npy")
+        if os.path.exists(cache_file):
+            try:
+                emb = np.load(cache_file).astype(np.float32)
+                if len(emb) == len(df):
+                    return emb
+            except Exception:
+                pass
+
+    emb = model.encode(_combined_text(df), batch_size=batch_size,
+                       show_progress_bar=True, normalize_embeddings=True,
+                       convert_to_numpy=True).astype(np.float32)
+
+    if cache_file:
+        try:
+            np.save(cache_file, emb.astype(np.float16))
+        except Exception as e:
+            print(f"    Warning: Could not save vector cache: {e}")
+
+    return emb
+
+
+def embedding_knn_candidates(s1_df, other_df, top_k=None, model_name=None, batch_size=None, cache_path=None, s1_tag=None, other_tag=None):
     """
     For each S1 record, find the top_k nearest Source-2/3 records by cosine
     similarity on sentence embeddings of (normalized name + address).
@@ -49,6 +131,9 @@ def embedding_knn_candidates(s1_df, other_df, top_k=None, model_name=None, batch
     When CFG.USE_FAISS_GPU is True (auto-detected), uses FAISS-GPU for
     sub-second kNN search over millions of vectors.
     """
+    if cache_path and os.path.exists(cache_path):
+        return load_candidates_cache(cache_path)
+
     import faiss
     from sentence_transformers import SentenceTransformer
 
@@ -66,12 +151,8 @@ def embedding_knn_candidates(s1_df, other_df, top_k=None, model_name=None, batch
         if len(other_group) == 0 or len(s1_group) == 0:
             continue
 
-        s1_emb = model.encode(_combined_text(s1_group), batch_size=batch_size,
-                               show_progress_bar=True, normalize_embeddings=True,
-                               convert_to_numpy=True).astype(np.float32)
-        other_emb = model.encode(_combined_text(other_group), batch_size=batch_size,
-                                  show_progress_bar=True, normalize_embeddings=True,
-                                  convert_to_numpy=True).astype(np.float32)
+        s1_emb = _get_or_compute_embeddings(s1_group, country, model, batch_size, cache_key=s1_tag)
+        other_emb = _get_or_compute_embeddings(other_group, country, model, batch_size, cache_key=other_tag)
 
         k = min(top_k, len(other_group))
         dim = other_emb.shape[1]
@@ -93,36 +174,69 @@ def embedding_knn_candidates(s1_df, other_df, top_k=None, model_name=None, batch
         for i, s1_id in enumerate(s1_ids):
             candidates[s1_id].update(other_ids[j] for j in idx[i] if j >= 0)
 
-    return dict(candidates)
+    result = dict(candidates)
+    if cache_path:
+        save_candidates_cache(result, cache_path)
+
+    return result
 
 
-def generate_candidates(s1_df, s2_df, s3_df, use_embeddings=None):
+def generate_candidates(s1_df, s2_df, s3_df, use_embeddings=None, cache_prefix=None):
     """
     Union of string-key blocking and (optionally) embedding kNN, across both
     Source 2 and Source 3. Returns {s1_id: set(candidate_ids)}.
+    Optionally caches intermediate and combined results to disk.
     """
     use_embeddings = CFG.USE_EMBEDDING_BLOCKING if use_embeddings is None else use_embeddings
 
+    if cache_prefix:
+        combined_cache = f"{cache_prefix}_combined.parquet"
+        if os.path.exists(combined_cache):
+            print(f"Loading cached combined candidates from {combined_cache}...")
+            return load_candidates_cache(combined_cache)
+
+    s2_cache = f"{cache_prefix}_s2.parquet" if cache_prefix else None
+    s3_cache = f"{cache_prefix}_s3.parquet" if cache_prefix else None
+
     print("Generating string-key candidates (Source 2)...")
-    key_s2 = string_key_candidates(s1_df, s2_df)
+    key_s2 = string_key_candidates(s1_df, s2_df, cache_path=s2_cache)
     print("Generating string-key candidates (Source 3)...")
-    key_s3 = string_key_candidates(s1_df, s3_df)
+    key_s3 = string_key_candidates(s1_df, s3_df, cache_path=s3_cache)
 
     combined = defaultdict(set)
     for s1_id in s1_df["entity_id"]:
-        combined[s1_id] |= key_s2.get(s1_id, set())
-        combined[s1_id] |= key_s3.get(s1_id, set())
+        if s1_id in key_s2:
+            combined[s1_id].update(key_s2[s1_id])
+        if s1_id in key_s3:
+            combined[s1_id].update(key_s3[s1_id])
+
+    del key_s2, key_s3
+    gc.collect()
 
     if use_embeddings:
-        print("Generating embedding kNN candidates (Source 2)...")
-        emb_s2 = embedding_knn_candidates(s1_df, s2_df)
-        print("Generating embedding kNN candidates (Source 3)...")
-        emb_s3 = embedding_knn_candidates(s1_df, s3_df)
-        for s1_id in s1_df["entity_id"]:
-            combined[s1_id] |= emb_s2.get(s1_id, set())
-            combined[s1_id] |= emb_s3.get(s1_id, set())
+        emb_s2_cache = f"{cache_prefix}_emb_s2.parquet" if cache_prefix else None
+        emb_s3_cache = f"{cache_prefix}_emb_s3.parquet" if cache_prefix else None
+        s1_tag = f"{cache_prefix}_s1" if cache_prefix else None
+        s2_tag = f"{cache_prefix}_s2" if cache_prefix else None
+        s3_tag = f"{cache_prefix}_s3" if cache_prefix else None
 
-    return dict(combined)
+        print("Generating embedding kNN candidates (Source 2)...")
+        emb_s2 = embedding_knn_candidates(s1_df, s2_df, cache_path=emb_s2_cache, s1_tag=s1_tag, other_tag=s2_tag)
+        print("Generating embedding kNN candidates (Source 3)...")
+        emb_s3 = embedding_knn_candidates(s1_df, s3_df, cache_path=emb_s3_cache, s1_tag=s1_tag, other_tag=s3_tag)
+        for s1_id in s1_df["entity_id"]:
+            if s1_id in emb_s2:
+                combined[s1_id].update(emb_s2[s1_id])
+            if s1_id in emb_s3:
+                combined[s1_id].update(emb_s3[s1_id])
+        del emb_s2, emb_s3
+        gc.collect()
+
+    result = dict(combined)
+    if cache_prefix:
+        save_candidates_cache(result, f"{cache_prefix}_combined.parquet")
+
+    return result
 
 
 def candidate_recall(candidates: dict, ground_truth: dict) -> float:

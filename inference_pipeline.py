@@ -57,7 +57,8 @@ def main():
     tfidf_vec = fit_tfidf_on_all_text(s1_train, s2_train, s3_train, s1, s2, s3)
 
     print("Generating candidates for the full test Source-1 set...")
-    candidates = generate_candidates(s1, s2, s3)
+    cache_test_prefix = os.path.join(CFG.CACHE_DIR, "candidates_test")
+    candidates = generate_candidates(s1, s2, s3, cache_prefix=cache_test_prefix)
 
     # Every Source-1 entity must appear, even with an empty candidate/match list.
     all_s1_ids = set(s1["entity_id"])
